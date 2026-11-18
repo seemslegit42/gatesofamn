@@ -1,0 +1,6 @@
+{
+  "name": "Aethergate: Shards of Solis",
+  "description": "Cross-platform isometric multiplayer third-person MMORPG with diegetic UI, mobile touch controls, and Turso libSQL world persistence.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
