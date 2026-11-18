@@ -2,15 +2,17 @@
 
 import React from 'react';
 import { motion } from 'motion/react';
-import { Shield, Sparkles, Compass, Play } from 'lucide-react';
-import type { HeroClass } from '@/lib/game/types';
+import { Shield, Sparkles, Compass, Play, SlidersHorizontal } from 'lucide-react';
+import type { HeroAppearance, HeroClass } from '@/lib/game/types';
 import { CLASS_SPECS } from '@/lib/game/worldData';
 
 interface TitleScreenProps {
   heroName: string;
   heroClass: HeroClass;
+  appearance: HeroAppearance;
   onChangeName: (name: string) => void;
   onChangeClass: (heroClass: HeroClass) => void;
+  onOpenCreator: () => void;
   onStart: () => void;
 }
 
@@ -19,8 +21,10 @@ const CLASS_ORDER: HeroClass[] = ['vanguard', 'arcanist', 'ranger'];
 export default function TitleScreen({
   heroName,
   heroClass,
+  appearance,
   onChangeName,
   onChangeClass,
+  onOpenCreator,
   onStart,
 }: TitleScreenProps) {
   const handleSubmit = (e: React.FormEvent) => {
@@ -95,7 +99,7 @@ export default function TitleScreen({
           </label>
 
           {/* Class Selector */}
-          <div className="mb-5">
+          <div className="mb-4">
             <span className="block text-[11px] uppercase tracking-[0.14em] text-[#a9b4c7] font-semibold mb-2">
               Choose Path
             </span>
@@ -108,7 +112,7 @@ export default function TitleScreen({
                     key={cid}
                     type="button"
                     onClick={() => onChangeClass(cid)}
-                    className={`w-full text-left px-3.5 py-2.5 rounded-xl border transition-colors flex items-center gap-3 min-h-[44px] ${
+                    className={`w-full text-left px-3.5 py-2.5 rounded-xl border transition-colors flex items-center gap-3 min-h-[44px] cursor-pointer ${
                       selected
                         ? 'bg-[#1a2234] border-[#e5a93c] text-[#f8f5ee]'
                         : 'bg-[#0a0e16]/85 border-white/10 text-[#b8c2d4] hover:border-white/25'
@@ -136,6 +140,25 @@ export default function TitleScreen({
             </div>
           </div>
 
+          {/* Character Appearance Summary + Hero Forge Button */}
+          <div className="mb-4 flex items-center justify-between gap-2 rounded-xl bg-[#0a0e16] border border-white/10 px-3.5 py-2.5">
+            <div className="min-w-0">
+              <div className="text-[11px] text-[#9aa6bc]">Appearance</div>
+              <div className="text-xs font-semibold text-[#f8f5ee] capitalize truncate">
+                {appearance.bodyType} · {appearance.faceStyle} · {appearance.hairStyle} · {appearance.outfitStyle}
+              </div>
+            </div>
+            <button
+              type="button"
+              data-testid="open-hero-forge"
+              onClick={onOpenCreator}
+              className="h-10 px-3 rounded-lg bg-[#182235] border border-[#e5a93c]/40 hover:border-[#e5a93c] text-xs font-semibold text-[#e5a93c] flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <SlidersHorizontal className="w-3.5 h-3.5" />
+              <span>Customize</span>
+            </button>
+          </div>
+
           <button
             type="submit"
             data-start="true"
@@ -149,7 +172,7 @@ export default function TitleScreen({
 
       {/* Single Flat Borderless Control Hint */}
       <div className="text-center text-xs text-[#f8f5ee]/85 hud-text-stroke tracking-wide">
-        WASD or Click Ground Move · 1–3 Skills · Space Dash · Q/E Orbit · Esc Pause
+        WASD or Click Ground Move · 1–3 Skills · Space Dash · J Quests · Q/E Orbit · Esc Pause
       </div>
     </div>
   );

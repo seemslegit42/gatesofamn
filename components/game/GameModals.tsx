@@ -2,7 +2,7 @@
 
 import React, { useEffect, useState } from 'react';
 import { motion } from 'motion/react';
-import { X, Trophy, ShieldCheck, Play, RotateCcw, Home } from 'lucide-react';
+import { X, Trophy, ShieldCheck, Play, RotateCcw, Home, SlidersHorizontal } from 'lucide-react';
 import type { GameLifecycleState, InventoryItem, SnapshotPlayer } from '@/lib/game/types';
 
 interface LeaderboardRow {
@@ -22,6 +22,7 @@ interface GameModalsProps {
   onCloseInventory: () => void;
   onEquipItem: (itemId: string) => void;
   onResume: () => void;
+  onOpenCreator?: () => void;
   onRespawn: () => void;
   onReturnTitle: () => void;
 }
@@ -34,6 +35,7 @@ export default function GameModals({
   onCloseInventory,
   onEquipItem,
   onResume,
+  onOpenCreator,
   onRespawn,
   onReturnTitle,
 }: GameModalsProps) {
@@ -73,6 +75,16 @@ export default function GameModals({
               <Play className="w-4 h-4 fill-current" />
               <span>Resume</span>
             </button>
+            {onOpenCreator && (
+              <button
+                type="button"
+                onClick={onOpenCreator}
+                className="w-full h-11 rounded-xl bg-[#161f30] border border-[#e5a93c]/35 hover:border-[#e5a93c] text-[#e5a93c] font-semibold text-sm flex items-center justify-center gap-2 cursor-pointer"
+              >
+                <SlidersHorizontal className="w-4 h-4" />
+                <span>Hero Forge</span>
+              </button>
+            )}
             <button
               type="button"
               onClick={onReturnTitle}

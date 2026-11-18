@@ -85,6 +85,31 @@ class ProceduralAudioEngine {
       setTimeout(() => this.playTone(n, n * 1.02, 0.22, 'triangle', 0.075), idx * 80);
     });
   }
+
+  playCrowCaw() {
+    this.playTone(720, 460, 0.16, 'sawtooth', 0.055);
+    setTimeout(() => this.playTone(690, 410, 0.2, 'sawtooth', 0.05), 145);
+  }
+
+  playWhetstone() {
+    this.playTone(1240, 1780, 0.19, 'triangle', 0.045);
+    setTimeout(() => this.playTone(1520, 2140, 0.16, 'sine', 0.04), 110);
+  }
+
+  playHeavyBlow() {
+    this.playTone(145, 42, 0.24, 'sawtooth', 0.1);
+    this.playTone(92, 34, 0.28, 'sine', 0.09);
+  }
+
+  playWhistle() {
+    this.playTone(1880, 2360, 0.16, 'sine', 0.065);
+    setTimeout(() => this.playTone(2320, 1740, 0.22, 'sine', 0.06), 130);
+  }
+
+  playRoar() {
+    this.playTone(180, 74, 0.42, 'sawtooth', 0.1);
+    this.playTone(125, 54, 0.45, 'square', 0.06);
+  }
 }
 
 export const gameAudio = new ProceduralAudioEngine();

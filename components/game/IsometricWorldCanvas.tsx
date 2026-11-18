@@ -5,11 +5,14 @@ import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { Sky } from 'three/addons/objects/Sky.js';
 import type {
+  DynamicWorldEventState,
   GameLifecycleState,
   HeroClass,
   ShrineState,
+  SnapshotCompanion,
   SnapshotEnemy,
   SnapshotPlayer,
+  TacticalAdvice,
   WorldEffectEvent,
   WorldSnapshot,
 } from '@/lib/game/types';
@@ -19,14 +22,38 @@ import {
   WORLD_TERRAIN_SIZE,
   groundHeightAt,
 } from '@/lib/game/worldData';
+import { QUEST_BY_ID } from '@/lib/game/quests';
 import { createProceduralTexturePack } from '@/lib/three/textures';
 import {
+  buildCompanionRig,
   buildEnemyRig,
   buildHeroRig,
   buildShrineObeliskGroup,
+  buildWarhorseMountGroup,
+  buildWorldEventPortalGroup,
   type AnimatedActorRig,
 } from '@/lib/three/models';
 import { gameAudio } from '@/lib/three/audio';
+import {
+  computeAtmosphereState,
+  resolveGraphicsProfile,
+  resolveWeatherMode,
+  todPresetToNormalized,
+  type GraphicsSettings,
+  type HardwareCapabilities,
+  type ResolvedGraphicsProfile,
+  type ResolvedWeather,
+  type SurfaceAccumulationState,
+} from '@/lib/three/atmosphere';
+import {
+  createPostProcessingStack,
+  createRefractiveWaterMaterial,
+  createSharedAtmosphereUniforms,
+  createVolumetricMistMaterial,
+  createVolumetricShaftMaterial,
+  enhanceStylizedSurfaceMaterial,
+  syncSharedUniforms,
+} from '@/lib/three/shaders';
 
 export interface HudBridgeState {
   localPlayer: SnapshotPlayer | null;
@@ -34,9 +61,14 @@ export interface HudBridgeState {
   shrines: ShrineState[];
   allPlayers: SnapshotPlayer[];
   allEnemies: SnapshotEnemy[];
+  companions: SnapshotCompanion[];
+  tacticalAdvice: TacticalAdvice | null;
   onlineCount: number;
   dbMode: string;
   zoneName: string;
+  dynamicEvent: DynamicWorldEventState | null;
+  nextEventInSec: number;
+  serverTime: number;
 }
 
 export interface WorldControlApi {
@@ -44,17 +76,27 @@ export interface WorldControlApi {
   triggerSkill: (index: 0 | 1 | 2) => void;
   triggerDash: () => void;
   rotateCamera: (deltaYaw: number) => void;
+  setWaypoint: (x: number, z: number) => void;
+}
+
+export interface GraphicsStatusInfo {
+  profile: ResolvedGraphicsProfile;
+  isSoftwareGl: boolean;
+  todLabel: string;
+  resolvedWeather: ResolvedWeather;
 }
 
 interface IsometricWorldCanvasProps {
   gameState: GameLifecycleState;
   localPlayerId: string;
   snapshotRef: React.MutableRefObject<WorldSnapshot | null>;
+  graphicsSettings: GraphicsSettings;
   onSendInput: (moveX: number, moveZ: number, waypointX: number | null, waypointZ: number | null) => void;
   onCastSkill: (skillIndex: 0 | 1 | 2, aimX: number, aimZ: number, targetEnemyId?: string | null) => void;
   onDash: (dirX: number, dirZ: number) => void;
   onSelectTarget: (enemyId: string | null) => void;
   onHudSync: (hud: HudBridgeState) => void;
+  onGraphicsStatus?: (status: GraphicsStatusInfo) => void;
   controlApiRef: React.MutableRefObject<WorldControlApi | null>;
 }
 
@@ -99,6 +141,7 @@ const _groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
 
 function getZoneLabel(x: number, z: number): string {
   if (Math.hypot(x, z - 14) < 13) return 'Solis Sanctuary';
+  if (Math.hypot(x - -24, z - 21) < 16) return 'Barrowlands Ridge';
   if (z < -30) return 'Obsidian Citadel';
   if (x < -14) return 'Dawn Spire Glade';
   if (x > 14) return 'Verdant Crossing';
@@ -109,11 +152,13 @@ export default function IsometricWorldCanvas({
   gameState,
   localPlayerId,
   snapshotRef,
+  graphicsSettings,
   onSendInput,
   onCastSkill,
   onDash,
   onSelectTarget,
   onHudSync,
+  onGraphicsStatus,
   controlApiRef,
 }: IsometricWorldCanvasProps) {
   const mountRef = useRef<HTMLDivElement | null>(null);
@@ -121,12 +166,16 @@ export default function IsometricWorldCanvas({
 
   const gameStateRef = useRef(gameState);
   const localPlayerIdRef = useRef(localPlayerId);
+  const graphicsSettingsRef = useRef<GraphicsSettings>(graphicsSettings);
+  const applyGraphicsRef = useRef<(() => void) | null>(null);
+  const snapFramesRef = useRef<number>(4);
   const callbacksRef = useRef({
     onSendInput,
     onCastSkill,
     onDash,
     onSelectTarget,
     onHudSync,
+    onGraphicsStatus,
   });
 
   useEffect(() => {
@@ -138,14 +187,21 @@ export default function IsometricWorldCanvas({
   }, [localPlayerId]);
 
   useEffect(() => {
+    graphicsSettingsRef.current = graphicsSettings;
+    snapFramesRef.current = 3;
+    applyGraphicsRef.current?.();
+  }, [graphicsSettings]);
+
+  useEffect(() => {
     callbacksRef.current = {
       onSendInput,
       onCastSkill,
       onDash,
       onSelectTarget,
       onHudSync,
+      onGraphicsStatus,
     };
-  }, [onSendInput, onCastSkill, onDash, onSelectTarget, onHudSync]);
+  }, [onSendInput, onCastSkill, onDash, onSelectTarget, onHudSync, onGraphicsStatus]);
 
   useEffect(() => {
     const container = mountRef.current;
@@ -163,6 +219,14 @@ export default function IsometricWorldCanvas({
       return /SwiftShader|llvmpipe|softpipe|Software|Basic Render/i.test(gpu);
     })();
 
+    const getCaps = (): HardwareCapabilities => ({
+      isSoftwareGl,
+      devicePixelRatio: window.devicePixelRatio || 1,
+      hardwareConcurrency: navigator.hardwareConcurrency || 4,
+      viewportWidth: container.clientWidth || window.innerWidth,
+    });
+    let currentProfile = resolveGraphicsProfile(graphicsSettingsRef.current, getCaps());
+
     const renderer = new THREE.WebGLRenderer({
       antialias: !isSoftwareGl,
       powerPreference: 'high-performance',
@@ -171,10 +235,12 @@ export default function IsometricWorldCanvas({
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.08;
-    renderer.setPixelRatio(isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2));
-    renderer.shadowMap.enabled = !isSoftwareGl;
+    renderer.setPixelRatio(currentProfile.pixelRatio);
+    renderer.shadowMap.enabled = currentProfile.shadowsEnabled;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-    renderer.setSize(container.clientWidth || window.innerWidth, container.clientHeight || window.innerHeight);
+    const initW = container.clientWidth || window.innerWidth;
+    const initH = container.clientHeight || window.innerHeight;
+    renderer.setSize(initW, initH);
     renderer.domElement.style.display = 'block';
     renderer.domElement.style.width = '100%';
     renderer.domElement.style.height = '100%';
@@ -190,7 +256,10 @@ export default function IsometricWorldCanvas({
     scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
     pmrem.dispose();
 
-    // Procedural Daytime Sky
+    // Shared Custom Shader Atmosphere Uniforms
+    const sharedUniforms = createSharedAtmosphereUniforms();
+
+    // Procedural Daytime/Dynamic Sky
     const sky = new Sky();
     sky.scale.setScalar(600);
     const skyUniforms = sky.material.uniforms;
@@ -208,8 +277,8 @@ export default function IsometricWorldCanvas({
 
     const sunLight = new THREE.DirectionalLight(0xfff1d6, 2.1);
     sunLight.position.set(32, 46, 24);
-    sunLight.castShadow = !isSoftwareGl;
-    sunLight.shadow.mapSize.set(1024, 1024);
+    sunLight.castShadow = currentProfile.shadowsEnabled;
+    sunLight.shadow.mapSize.set(currentProfile.shadowMapSize, currentProfile.shadowMapSize);
     sunLight.shadow.camera.left = -45;
     sunLight.shadow.camera.right = 45;
     sunLight.shadow.camera.top = 45;
@@ -227,10 +296,12 @@ export default function IsometricWorldCanvas({
 
     const camera = new THREE.PerspectiveCamera(
       40,
-      (container.clientWidth || window.innerWidth) / (container.clientHeight || window.innerHeight),
+      initW / initH,
       0.5,
       360,
     );
+
+    const postStack = createPostProcessingStack(renderer, scene, camera, initW, initH, currentProfile);
 
     const textures = createProceduralTexturePack(renderer.capabilities.getMaxAnisotropy());
 
@@ -272,21 +343,25 @@ export default function IsometricWorldCanvas({
     terrainGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
     terrainGeo.computeVertexNormals();
 
-    const terrainMat = new THREE.MeshStandardMaterial({
-      color: 0xffffff,
-      map: textures.terrainAlbedo,
-      bumpMap: textures.terrainBump,
-      bumpScale: 0.08,
-      vertexColors: true,
-      roughness: 0.9,
-      metalness: 0.04,
-    });
+    const terrainMat = enhanceStylizedSurfaceMaterial(
+      new THREE.MeshStandardMaterial({
+        color: 0xffffff,
+        map: textures.terrainAlbedo,
+        bumpMap: textures.terrainBump,
+        bumpScale: 0.08,
+        vertexColors: true,
+        roughness: 0.9,
+        metalness: 0.04,
+      }),
+      sharedUniforms,
+      { allowSnow: true, allowCorruption: true, rimBoost: 0.45 },
+    );
     const terrainMesh = new THREE.Mesh(terrainGeo, terrainMat);
     terrainMesh.receiveShadow = true;
     scene.add(terrainMesh);
 
-    // River Water Plane (custom GLSL wave extension on MeshStandardMaterial)
-    const riverGeo = new THREE.PlaneGeometry(WORLD_TERRAIN_SIZE, 10.5, 48, 8);
+    // Refractive River Water Plane (custom GLSL waves, caustics, Fresnel & shoreline foam)
+    const riverGeo = new THREE.PlaneGeometry(WORLD_TERRAIN_SIZE, 10.5, 64, 12);
     riverGeo.rotateX(-Math.PI / 2);
     const rPos = riverGeo.attributes.position;
     for (let i = 0; i < rPos.count; i++) {
@@ -295,42 +370,33 @@ export default function IsometricWorldCanvas({
       rPos.setZ(i, rz - 4.5 + Math.sin(rx * 0.08) * 3.2);
     }
     riverGeo.computeVertexNormals();
-    const riverUniforms = { uTime: { value: 0 } };
-    const riverMat = new THREE.MeshStandardMaterial({
-      color: 0x1b627c,
-      roughness: 0.2,
-      metalness: 0.24,
-      envMapIntensity: 0.55,
-      transparent: true,
-      opacity: 0.9,
-    });
-    riverMat.onBeforeCompile = (shader) => {
-      shader.uniforms.uTime = riverUniforms.uTime;
-      shader.vertexShader = shader.vertexShader
-        .replace('#include <common>', '#include <common>\nuniform float uTime;')
-        .replace(
-          '#include <begin_vertex>',
-          '#include <begin_vertex>\ntransformed.y += sin(transformed.x * 0.45 + uTime * 2.2) * 0.04;',
-        );
-    };
+    const riverMat = createRefractiveWaterMaterial(sharedUniforms);
     const riverMesh = new THREE.Mesh(riverGeo, riverMat);
     riverMesh.position.y = -0.32;
     scene.add(riverMesh);
 
     // Stone Bridge across the river at x=0, z=-4.5
-    const stoneMat = new THREE.MeshStandardMaterial({
-      color: 0xffffff,
-      map: textures.stoneAlbedo,
-      bumpMap: textures.stoneBump,
-      bumpScale: 0.05,
-      roughness: 0.82,
-      metalness: 0.08,
-    });
-    const trimGoldMat = new THREE.MeshStandardMaterial({
-      color: 0xd49c42,
-      roughness: 0.3,
-      metalness: 0.78,
-    });
+    const stoneMat = enhanceStylizedSurfaceMaterial(
+      new THREE.MeshStandardMaterial({
+        color: 0xffffff,
+        map: textures.stoneAlbedo,
+        bumpMap: textures.stoneBump,
+        bumpScale: 0.05,
+        roughness: 0.82,
+        metalness: 0.08,
+      }),
+      sharedUniforms,
+      { allowSnow: true, allowCorruption: true, rimBoost: 0.72 },
+    );
+    const trimGoldMat = enhanceStylizedSurfaceMaterial(
+      new THREE.MeshStandardMaterial({
+        color: 0xd49c42,
+        roughness: 0.3,
+        metalness: 0.78,
+      }),
+      sharedUniforms,
+      { allowSnow: false, allowCorruption: false, rimBoost: 1.05 },
+    );
     const bridgeDeck = new THREE.Mesh(new THREE.BoxGeometry(6.8, 0.52, 11.2), stoneMat);
     bridgeDeck.position.set(0, 0.16, -4.5);
     bridgeDeck.receiveShadow = true;
@@ -396,7 +462,28 @@ export default function IsometricWorldCanvas({
       emissiveIntensity: 0.9,
       roughness: 0.2,
     });
-    // World Pillars & Boulders from WORLD_OBSTACLES
+    const boulderMat = enhanceStylizedSurfaceMaterial(
+      new THREE.MeshStandardMaterial({ color: 0x5b5851, roughness: 0.9, metalness: 0.05 }),
+      sharedUniforms,
+      { allowSnow: true, allowCorruption: true, rimBoost: 0.65 },
+    );
+    const barrowTurfMat = enhanceStylizedSurfaceMaterial(
+      new THREE.MeshStandardMaterial({ color: 0x3b4d34, roughness: 0.94, metalness: 0.02 }),
+      sharedUniforms,
+      { allowSnow: true, allowCorruption: true, rimBoost: 0.5 },
+    );
+    const blackOakMat = enhanceStylizedSurfaceMaterial(
+      new THREE.MeshStandardMaterial({ color: 0x241d18, roughness: 0.94, metalness: 0.04 }),
+      sharedUniforms,
+      { allowSnow: false, allowCorruption: true, rimBoost: 0.4 },
+    );
+    const thornFoliageMat = enhanceStylizedSurfaceMaterial(
+      new THREE.MeshStandardMaterial({ color: 0x263529, roughness: 0.92, metalness: 0.02 }),
+      sharedUniforms,
+      { allowSnow: true, allowCorruption: true, isFoliage: true, rimBoost: 0.7 },
+    );
+
+    // World Pillars, Boulders, Barrow Mound & Liar's Copse from WORLD_OBSTACLES
     for (const obs of WORLD_OBSTACLES) {
       if (obs.kind === 'obelisk') continue; // Built as Shrine Obelisks below
       const y = groundHeightAt(obs.x, obs.z);
@@ -414,10 +501,44 @@ export default function IsometricWorldCanvas({
         lantern.position.y = obs.height + 0.38;
         g.add(plinth, shaft, cap, lantern);
         scene.add(g);
+      } else if (obs.kind === 'barrow') {
+        const bg = new THREE.Group();
+        bg.position.set(obs.x, y, obs.z);
+        const mound = new THREE.Mesh(
+          new THREE.SphereGeometry(obs.radius, 18, 10, 0, Math.PI * 2, 0, Math.PI * 0.5),
+          barrowTurfMat,
+        );
+        mound.scale.set(1.08, 0.68, 0.94);
+        mound.receiveShadow = true;
+        mound.castShadow = true;
+        const leftSlab = new THREE.Mesh(new THREE.BoxGeometry(0.65, 2.3, 0.5), stoneMat);
+        leftSlab.position.set(-0.95, 2.1, 0.2);
+        const rightSlab = new THREE.Mesh(new THREE.BoxGeometry(0.65, 2.3, 0.5), stoneMat);
+        rightSlab.position.set(0.95, 2.1, 0.2);
+        const lintel = new THREE.Mesh(new THREE.BoxGeometry(2.8, 0.55, 0.85), stoneMat);
+        lintel.position.set(0, 3.35, 0.2);
+        bg.add(mound, leftSlab, rightSlab, lintel);
+        scene.add(bg);
+      } else if (obs.kind === 'copse') {
+        const cg = new THREE.Group();
+        cg.position.set(obs.x, y, obs.z);
+        const oakTrunk = new THREE.Mesh(new THREE.CylinderGeometry(0.26, 0.44, obs.height, 7), blackOakMat);
+        oakTrunk.position.y = obs.height * 0.5;
+        oakTrunk.rotation.z = 0.08;
+        oakTrunk.castShadow = true;
+        const crown = new THREE.Mesh(new THREE.DodecahedronGeometry(obs.radius * 0.92, 1), thornFoliageMat);
+        crown.position.set(0.15, obs.height + 0.4, 0);
+        crown.scale.set(1.25, 0.72, 1.15);
+        crown.castShadow = true;
+        const bramble = new THREE.Mesh(new THREE.DodecahedronGeometry(obs.radius * 0.68, 0), thornFoliageMat);
+        bramble.position.set(-0.4, 0.45, 0.35);
+        bramble.scale.set(1.3, 0.55, 1.2);
+        cg.add(oakTrunk, crown, bramble);
+        scene.add(cg);
       } else {
         const rock = new THREE.Mesh(
           new THREE.DodecahedronGeometry(obs.radius, 1),
-          new THREE.MeshStandardMaterial({ color: 0x5b5851, roughness: 0.9, metalness: 0.05 }),
+          boulderMat,
         );
         rock.position.set(obs.x, y + obs.radius * 0.42, obs.z);
         rock.scale.set(1.1, 0.78, 0.96);
@@ -427,21 +548,48 @@ export default function IsometricWorldCanvas({
       }
     }
 
+    // Circling Crow Sentinel Flock above Barrow Mound / Liar's Copse
+    const crowFlockGroup = new THREE.Group();
+    const crowGeo = new THREE.ConeGeometry(0.16, 0.48, 3);
+    crowGeo.rotateX(Math.PI / 2);
+    const crowMat = new THREE.MeshStandardMaterial({ color: 0x111318, roughness: 0.7, metalness: 0.1 });
+    const crowBirds: { mesh: THREE.Mesh; radius: number; speed: number; phase: number; height: number }[] = [];
+    for (let i = 0; i < 6; i++) {
+      const m = new THREE.Mesh(crowGeo, crowMat);
+      crowFlockGroup.add(m);
+      crowBirds.push({
+        mesh: m,
+        radius: 3.8 + (i % 3) * 2.1,
+        speed: 1.05 + (i % 2) * 0.35,
+        phase: (i / 6) * Math.PI * 2,
+        height: 6.2 + (i % 3) * 1.1,
+      });
+    }
+    scene.add(crowFlockGroup);
+
     // Instanced Multi-Tier Pine Groves & Outer Perimeter Cliffs
     const treeCount = 72;
     const trunkGeo = new THREE.CylinderGeometry(0.18, 0.3, 2.2, 6);
     trunkGeo.translate(0, 1.1, 0);
-    const trunkMat = new THREE.MeshStandardMaterial({ color: 0x4f3928, roughness: 0.92, envMapIntensity: 0.25 });
+    const trunkMat = enhanceStylizedSurfaceMaterial(
+      new THREE.MeshStandardMaterial({ color: 0x4f3928, roughness: 0.92, envMapIntensity: 0.25 }),
+      sharedUniforms,
+      { allowSnow: false, allowCorruption: true, rimBoost: 0.45 },
+    );
     const canopyGeo = new THREE.ConeGeometry(1.45, 3.0, 7);
     canopyGeo.translate(0, 3.0, 0);
     const upperCanopyGeo = new THREE.ConeGeometry(1.02, 2.4, 7);
     upperCanopyGeo.translate(0, 4.4, 0);
-    const canopyMat = new THREE.MeshStandardMaterial({
-      color: 0x2f5f35,
-      roughness: 0.94,
-      metalness: 0.02,
-      envMapIntensity: 0.22,
-    });
+    const canopyMat = enhanceStylizedSurfaceMaterial(
+      new THREE.MeshStandardMaterial({
+        color: 0x2f5f35,
+        roughness: 0.94,
+        metalness: 0.02,
+        envMapIntensity: 0.22,
+      }),
+      sharedUniforms,
+      { allowSnow: true, allowCorruption: true, isFoliage: true, rimBoost: 0.85 },
+    );
 
     const trunks = new THREE.InstancedMesh(trunkGeo, trunkMat, treeCount);
     const canopies = new THREE.InstancedMesh(canopyGeo, canopyMat, treeCount);
@@ -483,7 +631,11 @@ export default function IsometricWorldCanvas({
     // Outer Ridge Boulders
     const cliffCount = 44;
     const cliffGeo = new THREE.DodecahedronGeometry(3.2, 1);
-    const cliffMat = new THREE.MeshStandardMaterial({ color: 0x5c5852, roughness: 0.92 });
+    const cliffMat = enhanceStylizedSurfaceMaterial(
+      new THREE.MeshStandardMaterial({ color: 0x5c5852, roughness: 0.92 }),
+      sharedUniforms,
+      { allowSnow: true, allowCorruption: true, rimBoost: 0.68 },
+    );
     const cliffs = new THREE.InstancedMesh(cliffGeo, cliffMat, cliffCount);
     for (let i = 0; i < cliffCount; i++) {
       const a = (i / cliffCount) * Math.PI * 2;
@@ -500,6 +652,82 @@ export default function IsometricWorldCanvas({
     cliffs.computeBoundingSphere();
     scene.add(cliffs);
 
+    // Volumetric Ground Mist Layers & Angled Sun/Sanctuary Light Shafts
+    const mistGeo = new THREE.PlaneGeometry(132, 132);
+    mistGeo.rotateX(-Math.PI / 2);
+    const mistMat = createVolumetricMistMaterial(sharedUniforms);
+    const mistLayers: THREE.Mesh[] = [];
+    const mistHeights = [0.22, 0.78, 1.42, 2.15, 2.95];
+    for (let i = 0; i < mistHeights.length; i++) {
+      const mLayer = new THREE.Mesh(mistGeo, mistMat);
+      mLayer.position.set(0, mistHeights[i], -4);
+      mLayer.rotation.y = i * 0.55;
+      mLayer.visible = i < currentProfile.volumetricLayers;
+      scene.add(mLayer);
+      mistLayers.push(mLayer);
+    }
+
+    const shaftGeo = new THREE.PlaneGeometry(14, 24);
+    const shaftMat = createVolumetricShaftMaterial(sharedUniforms);
+    const shaftConfigs: [number, number, number][] = [
+      [0, 11, 21.5],
+      [0, 10, -4.5],
+      [-22, 10.5, -18],
+    ];
+    const shaftMeshes: THREE.Mesh[] = shaftConfigs.map(([sx, sy, sz], idx) => {
+      const mesh = new THREE.Mesh(shaftGeo, shaftMat);
+      mesh.position.set(sx, sy, sz);
+      mesh.rotation.y = 0.65 + idx * 0.35;
+      mesh.rotation.z = -0.24;
+      mesh.visible = currentProfile.tier !== 'low';
+      scene.add(mesh);
+      return mesh;
+    });
+
+    // Dynamic Precipitation Particles (Rain Streaks / Snow Motes / Corruption Embers)
+    const MAX_PRECIP = 620;
+    const precipGeo = new THREE.BoxGeometry(0.055, 0.95, 0.055);
+    const precipMat = new THREE.MeshBasicMaterial({
+      color: 0xbfe4ff,
+      transparent: true,
+      opacity: 0.62,
+      depthWrite: false,
+    });
+    const precipMesh = new THREE.InstancedMesh(precipGeo, precipMat, MAX_PRECIP);
+    precipMesh.frustumCulled = false;
+    precipMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    precipMesh.visible = false;
+    scene.add(precipMesh);
+
+    const precipDrops = Array.from({ length: MAX_PRECIP }, (_, idx) => {
+      const s1 = Math.sin(idx * 12.9898) * 43758.5453;
+      const s2 = Math.sin(idx * 78.233) * 43758.5453;
+      const s3 = Math.sin(idx * 39.346) * 43758.5453;
+      return {
+        ox: (s1 - Math.floor(s1) - 0.5) * 64,
+        oy: (s2 - Math.floor(s2)) * 22,
+        oz: (s3 - Math.floor(s3) - 0.5) * 64,
+        phase: (idx % 97) * 0.065,
+      };
+    });
+
+    // Helper to add stylized rim/weather shading once per material
+    const applyActorShaderEnhance = (rootObj: THREE.Object3D) => {
+      rootObj.traverse((child) => {
+        if (child instanceof THREE.Mesh && child.material instanceof THREE.MeshStandardMaterial) {
+          const mat = child.material;
+          if (!mat.userData.agEnhanced && mat.emissiveIntensity < 0.55) {
+            mat.userData.agEnhanced = true;
+            enhanceStylizedSurfaceMaterial(mat, sharedUniforms, {
+              allowSnow: false,
+              allowCorruption: false,
+              rimBoost: 1.15,
+            });
+          }
+        }
+      });
+    };
+
     // Shrine Obelisks
     const shrineVisuals = new Map<
       string,
@@ -510,6 +738,7 @@ export default function IsometricWorldCanvas({
       if (!vis) {
         vis = buildShrineObeliskGroup(textures.runeRing, textures.stoneAlbedo, textures.stoneBump, s.radius);
         vis.group.position.set(s.x, groundHeightAt(s.x, s.z), s.z);
+        applyActorShaderEnhance(vis.group);
         scene.add(vis.group);
         shrineVisuals.set(s.id, vis);
       }
@@ -555,6 +784,29 @@ export default function IsometricWorldCanvas({
     targetRingMesh.rotation.x = -Math.PI / 2;
     targetRingMesh.visible = false;
     scene.add(targetRingMesh);
+
+    // Diegetic 3D Quest Compass Chevron hovering around the local player
+    const questCompassGeo = new THREE.ConeGeometry(0.28, 0.72, 4);
+    questCompassGeo.rotateX(Math.PI / 2);
+    const questCompassMat = new THREE.MeshStandardMaterial({
+      color: 0xfde047,
+      emissive: 0xe5a93c,
+      emissiveIntensity: 0.9,
+      roughness: 0.25,
+      metalness: 0.55,
+    });
+    const questCompassMesh = new THREE.Mesh(questCompassGeo, questCompassMat);
+    questCompassMesh.visible = false;
+    scene.add(questCompassMesh);
+
+    // Active Dynamic World Event Portal Visual
+    let activeEventVisual: {
+      eventId: string;
+      group: THREE.Group;
+      core: THREE.Object3D;
+      ring: THREE.Mesh;
+      beam: THREE.Mesh;
+    } | null = null;
 
     // Pooled Enemy Attack Telegraph Rings (max 6 concurrent)
     const telegraphPool: THREE.Mesh[] = [];
@@ -651,10 +903,27 @@ export default function IsometricWorldCanvas({
       if (particleMesh.instanceColor) particleMesh.instanceColor.needsUpdate = true;
     };
 
-    // Entity Maps (Players, Enemies, Projectiles, Loot)
+    // Entity Maps (Players, Companions, Enemies, Projectiles, Loot)
     const playerRigs = new Map<
       string,
-      { rig: AnimatedActorRig; heroClass: HeroClass; sx: number; sz: number; walkPhase: number }
+      {
+        rig: AnimatedActorRig;
+        mountMesh: THREE.Group;
+        heroClass: HeroClass;
+        appearanceSig: string;
+        sx: number;
+        sz: number;
+        walkPhase: number;
+      }
+    >();
+    const companionRigs = new Map<
+      string,
+      {
+        rig: AnimatedActorRig;
+        sx: number;
+        sz: number;
+        walkPhase: number;
+      }
     >();
     const enemyRigs = new Map<
       string,
@@ -779,6 +1048,9 @@ export default function IsometricWorldCanvas({
       rotateCamera: (deltaYaw: number) => {
         targetCameraYaw += deltaYaw;
       },
+      setWaypoint: (x: number, z: number) => {
+        callbacksRef.current.onSendInput(0, 0, Number(x.toFixed(2)), Number(z.toFixed(2)));
+      },
     };
 
     const computeCameraRelativeMove = () => {
@@ -814,7 +1086,7 @@ export default function IsometricWorldCanvas({
 
       keysPressed.add(e.code);
       if (!e.repeat) {
-        if (e.code === 'Digit1' || e.code === 'KeyJ') castSkillAtAim(0);
+        if (e.code === 'Digit1') castSkillAtAim(0);
         else if (e.code === 'Digit2' || e.code === 'KeyK') castSkillAtAim(1);
         else if (e.code === 'Digit3' || e.code === 'KeyL') castSkillAtAim(2);
         else if (e.code === 'Space') {
@@ -905,6 +1177,31 @@ export default function IsometricWorldCanvas({
     renderer.domElement.addEventListener('pointerdown', onPointerDown);
     renderer.domElement.addEventListener('pointerup', onPointerUp);
 
+    // Runtime Graphics Quality Application
+    const applyCurrentGraphicsSettings = () => {
+      const next = resolveGraphicsProfile(graphicsSettingsRef.current, getCaps());
+      const prevShadowSize = sunLight.shadow.mapSize.x;
+      currentProfile = next;
+      renderer.setPixelRatio(next.pixelRatio);
+      renderer.shadowMap.enabled = next.shadowsEnabled;
+      sunLight.castShadow = next.shadowsEnabled;
+      if (prevShadowSize !== next.shadowMapSize) {
+        sunLight.shadow.mapSize.set(next.shadowMapSize, next.shadowMapSize);
+        sunLight.shadow.map?.dispose();
+        sunLight.shadow.map = null;
+      }
+      const cw = container.clientWidth || window.innerWidth;
+      const ch = container.clientHeight || window.innerHeight;
+      renderer.setSize(cw, ch);
+      postStack.resize(cw, ch, next.pixelRatio, next.bloomHalfRes);
+      for (let i = 0; i < mistLayers.length; i++) {
+        mistLayers[i].visible = i < next.volumetricLayers;
+      }
+      document.body.dataset.gfxTier = next.tier;
+    };
+    applyGraphicsRef.current = applyCurrentGraphicsSettings;
+    document.body.dataset.gfxTier = currentProfile.tier;
+
     // ResizeObserver for crisp canvas sizing (re-render immediately so resize never flashes blank)
     const resizeObserver = new ResizeObserver((entries) => {
       for (const entry of entries) {
@@ -913,7 +1210,12 @@ export default function IsometricWorldCanvas({
         camera.aspect = w / h;
         camera.updateProjectionMatrix();
         renderer.setSize(w, h);
-        renderer.render(scene, camera);
+        postStack.resize(w, h, currentProfile.pixelRatio, currentProfile.bloomHalfRes);
+        if (currentProfile.postProcessEnabled) {
+          postStack.composer.render();
+        } else {
+          renderer.render(scene, camera);
+        }
       }
     });
     resizeObserver.observe(container);
@@ -928,6 +1230,8 @@ export default function IsometricWorldCanvas({
     let disposed = false;
     let lastFrameMs = performance.now();
     let elapsedTotal = 0;
+    let frameCount = 0;
+    let surfaceState: SurfaceAccumulationState = { wetness: 0, snow: 0, corruption: 0.14 };
 
     function afterDraw(cb: () => void) {
       const gl = renderer.getContext() as WebGL2RenderingContext;
@@ -964,7 +1268,59 @@ export default function IsometricWorldCanvas({
       }
       const animDt = hitstopTimer > 0 ? 0 : rawDt;
 
-      riverUniforms.uTime.value = elapsedTotal;
+      // Update Atmosphere, Time-of-Day, Weather Surface States, Lighting, & Post-Processing
+      const gfx = graphicsSettingsRef.current;
+      const todNorm = todPresetToNormalized(gfx.timeOfDay, elapsedTotal);
+      let activeWeather = resolveWeatherMode(gfx.weather, elapsedTotal);
+      const dynEvent = snapshotRef.current?.dynamicEvent;
+      if (gfx.weather === 'auto' && dynEvent?.status === 'active' && dynEvent.weatherHint !== 'clear') {
+        activeWeather = dynEvent.weatherHint;
+      }
+      const riftCount = snapshotRef.current
+        ? snapshotRef.current.shrines.filter((s) => s.controllingFaction === 'rift').length
+        : 1;
+      const shouldSnap = frameCount < 4 || snapFramesRef.current > 0;
+      if (snapFramesRef.current > 0) snapFramesRef.current--;
+      const atmo = computeAtmosphereState(
+        todNorm,
+        activeWeather,
+        surfaceState,
+        rawDt,
+        riftCount,
+        shouldSnap,
+      );
+      frameCount++;
+      surfaceState = atmo.surface;
+
+      // Sync Sky, 3-Point Lighting, IBL Intensity, Fog, & Shared GLSL Uniforms
+      skyUniforms['turbidity'].value = atmo.skyTurbidity;
+      skyUniforms['rayleigh'].value = atmo.skyRayleigh;
+      skyUniforms['sunPosition'].value.set(atmo.sunDirection[0], atmo.sunDirection[1], atmo.sunDirection[2]);
+      hemiLight.color.setHex(atmo.hemiSkyColor);
+      hemiLight.groundColor.setHex(atmo.hemiGroundColor);
+      hemiLight.intensity = atmo.hemiIntensity;
+      sunLight.color.setHex(atmo.sunColor);
+      sunLight.intensity = atmo.sunIntensity;
+      rimLight.color.setHex(atmo.rimColor);
+      rimLight.intensity = atmo.rimIntensity;
+      scene.environmentIntensity = atmo.envIntensity;
+      (scene.background as THREE.Color).setHex(atmo.fogColor);
+      const fog = scene.fog as THREE.FogExp2;
+      fog.color.setHex(atmo.fogColor);
+      fog.density = atmo.fogDensity;
+      renderer.toneMappingExposure = atmo.exposure;
+
+      syncSharedUniforms(sharedUniforms, atmo, elapsedTotal, currentProfile.waterWaveOctaves);
+      postStack.update(atmo, currentProfile);
+
+      for (let i = 0; i < shaftMeshes.length; i++) {
+        shaftMeshes[i].visible = currentProfile.tier !== 'low' && atmo.shaftIntensity > 0.05;
+        shaftMeshes[i].rotation.z = -atmo.sunDirection[0] * 0.35;
+      }
+
+      document.body.dataset.tod = atmo.todLabel.toLowerCase();
+      document.body.dataset.weather = activeWeather;
+
       monCrystal.rotation.y += rawDt * 0.9;
       monCrystal.position.y = 4.5 + Math.sin(elapsedTotal * 1.8) * 0.22;
 
@@ -999,19 +1355,84 @@ export default function IsometricWorldCanvas({
           }
         }
 
+        // Sync Dynamic World Event Portal
+        if (snap.dynamicEvent && snap.dynamicEvent.status === 'active') {
+          const evState = snap.dynamicEvent;
+          if (!activeEventVisual || activeEventVisual.eventId !== evState.id) {
+            if (activeEventVisual) {
+              scene.remove(activeEventVisual.group);
+            }
+            const portal = buildWorldEventPortalGroup(evState.kind, textures.runeRing, evState.radius);
+            portal.group.position.set(evState.x, groundHeightAt(evState.x, evState.z), evState.z);
+            applyActorShaderEnhance(portal.group);
+            scene.add(portal.group);
+            activeEventVisual = { eventId: evState.id, ...portal };
+          }
+          activeEventVisual.core.rotation.y += rawDt * 1.9;
+          activeEventVisual.core.rotation.z += rawDt * 1.1;
+          activeEventVisual.ring.rotation.z -= rawDt * 0.45;
+          const beamMat = activeEventVisual.beam.material as THREE.MeshBasicMaterial;
+          beamMat.opacity = 0.14 + Math.sin(elapsedTotal * 3.5) * 0.05;
+        } else if (activeEventVisual) {
+          scene.remove(activeEventVisual.group);
+          activeEventVisual = null;
+        }
+
+        // Update Circling Crow Sentinel Flock above Barrow Mound
+        const crowAlert = Boolean(snap.tacticalAdvice?.crowAlert);
+        crowFlockGroup.visible = crowAlert;
+        if (crowAlert) {
+          const cx = snap.dynamicEvent?.kind === 'barrow_ambush' ? snap.dynamicEvent.x : -23;
+          const cz = snap.dynamicEvent?.kind === 'barrow_ambush' ? snap.dynamicEvent.z : 21;
+          for (const bird of crowBirds) {
+            const a = elapsedTotal * bird.speed + bird.phase;
+            const bx = cx + Math.cos(a) * bird.radius;
+            const bz = cz + Math.sin(a) * bird.radius;
+            bird.mesh.position.set(
+              bx,
+              groundHeightAt(bx, bz) + bird.height + Math.sin(elapsedTotal * 5 + bird.phase) * 0.35,
+              bz,
+            );
+            bird.mesh.rotation.y = -a;
+          }
+        }
+
         // Sync Players
         const activePlayerIds = new Set<string>();
         for (const p of snap.players) {
           activePlayerIds.add(p.id);
           const isLocal = p.id === localPlayerIdRef.current;
+          const appearanceSig = JSON.stringify(p.appearance);
           let entry = playerRigs.get(p.id);
-          if (!entry || entry.heroClass !== p.heroClass) {
+          if (!entry || entry.heroClass !== p.heroClass || entry.appearanceSig !== appearanceSig) {
             if (entry) scene.remove(entry.rig.root);
-            const rig = buildHeroRig(p.heroClass, isLocal, textures.contactShadow, textures.runeRing);
+            const rig = buildHeroRig(
+              p.heroClass,
+              isLocal,
+              textures.contactShadow,
+              textures.runeRing,
+              p.appearance,
+            );
+            const mountMesh = buildWarhorseMountGroup(0xe5a93c);
+            mountMesh.position.y = -0.72;
+            mountMesh.visible = Boolean(p.mounted);
+            rig.bodyPivot.add(mountMesh);
+            applyActorShaderEnhance(rig.root);
             scene.add(rig.root);
-            entry = { rig, heroClass: p.heroClass, sx: p.x, sz: p.z, walkPhase: 0 };
+            entry = {
+              rig,
+              mountMesh,
+              heroClass: p.heroClass,
+              appearanceSig,
+              sx: p.x,
+              sz: p.z,
+              walkPhase: 0,
+            };
             playerRigs.set(p.id, entry);
           }
+
+          entry.mountMesh.visible = Boolean(p.mounted);
+          entry.rig.bodyPivot.position.y = p.mounted ? 0.72 : 0;
 
           const prevX = entry.sx;
           const prevZ = entry.sz;
@@ -1022,7 +1443,7 @@ export default function IsometricWorldCanvas({
           entry.rig.root.visible = p.alive;
 
           const stepDist = Math.hypot(entry.sx - prevX, entry.sz - prevZ);
-          entry.walkPhase += stepDist * 3.1;
+          entry.walkPhase += stepDist * (p.mounted ? 2.4 : 3.1);
           const speedRatio = Math.min(1, stepDist / Math.max(0.001, animDt * 7));
 
           // Smooth facing rotation
@@ -1034,8 +1455,14 @@ export default function IsometricWorldCanvas({
 
           // Distance-synced stride & cast swing
           const legSwing = Math.sin(entry.walkPhase) * 0.65 * speedRatio;
-          entry.rig.leftLeg.rotation.x = legSwing;
-          entry.rig.rightLeg.rotation.x = -legSwing;
+          if (p.mounted) {
+            entry.rig.leftLeg.rotation.x = -0.45;
+            entry.rig.rightLeg.rotation.x = -0.45;
+            entry.rig.bodyPivot.position.y = 0.72 + Math.abs(Math.sin(entry.walkPhase)) * 0.14 * speedRatio;
+          } else {
+            entry.rig.leftLeg.rotation.x = legSwing;
+            entry.rig.rightLeg.rotation.x = -legSwing;
+          }
           entry.rig.leftArm.rotation.x = -legSwing * 0.7;
           if (p.castFlashTimer > 0) {
             entry.rig.rightArm.rotation.x = -Math.PI * 0.45 * (p.castFlashTimer / 0.24);
@@ -1070,6 +1497,31 @@ export default function IsometricWorldCanvas({
             } else {
               waypointMesh.visible = false;
             }
+
+            // Diegetic 3D Quest Compass Chevron pointing toward active tracked quest objective
+            const trackedDef = p.trackedQuestId ? QUEST_BY_ID[p.trackedQuestId] : undefined;
+            if (trackedDef && p.alive && state === 'playing') {
+              const qdx = trackedDef.targetX - entry.sx;
+              const qdz = trackedDef.targetZ - entry.sz;
+              const qdist = Math.hypot(qdx, qdz);
+              if (qdist > 3.5) {
+                const dirX = qdx / qdist;
+                const dirZ = qdz / qdist;
+                const cx = entry.sx + dirX * 1.85;
+                const cz = entry.sz + dirZ * 1.85;
+                questCompassMesh.visible = true;
+                questCompassMesh.position.set(
+                  cx,
+                  groundHeightAt(cx, cz) + 0.28 + Math.sin(elapsedTotal * 4) * 0.06,
+                  cz,
+                );
+                questCompassMesh.rotation.y = Math.atan2(dirX, dirZ);
+              } else {
+                questCompassMesh.visible = false;
+              }
+            } else {
+              questCompassMesh.visible = false;
+            }
           }
 
           // World-space nameplate for remote players (or local player low HP)
@@ -1094,15 +1546,81 @@ export default function IsometricWorldCanvas({
           }
         }
 
+        // Sync Warband Companions (Graymstrum, Haft, Worgen, Krydon, Hellas, Rykker, Proudis)
+        const activeCompIds = new Set<string>();
+        for (const comp of snap.companions ?? []) {
+          activeCompIds.add(comp.id);
+          let entry = companionRigs.get(comp.id);
+          if (!entry) {
+            const rig = buildCompanionRig(comp, textures.contactShadow, textures.runeRing);
+            applyActorShaderEnhance(rig.root);
+            scene.add(rig.root);
+            entry = { rig, sx: comp.x, sz: comp.z, walkPhase: 0 };
+            companionRigs.set(comp.id, entry);
+          }
+          const prevX = entry.sx;
+          const prevZ = entry.sz;
+          entry.sx = THREE.MathUtils.damp(entry.sx, comp.x, 14, animDt);
+          entry.sz = THREE.MathUtils.damp(entry.sz, comp.z, 14, animDt);
+          const cy = groundHeightAt(entry.sx, entry.sz);
+          entry.rig.root.position.set(entry.sx, cy, entry.sz);
+
+          const stepDist = Math.hypot(entry.sx - prevX, entry.sz - prevZ);
+          entry.walkPhase += stepDist * (comp.mounted ? 2.4 : 3.0);
+          const speedRatio = Math.min(1, stepDist / Math.max(0.001, animDt * 7));
+
+          const adiff = Math.atan2(
+            Math.sin(comp.facing - entry.rig.bodyPivot.rotation.y),
+            Math.cos(comp.facing - entry.rig.bodyPivot.rotation.y),
+          );
+          entry.rig.bodyPivot.rotation.y += adiff * Math.min(1, animDt * 12);
+          const swing = Math.sin(entry.walkPhase) * 0.55 * speedRatio;
+          if (!comp.mounted) {
+            entry.rig.leftLeg.rotation.x = swing;
+            entry.rig.rightLeg.rotation.x = -swing;
+          } else {
+            entry.rig.bodyPivot.position.y = Math.abs(Math.sin(entry.walkPhase)) * 0.14 * speedRatio;
+          }
+          entry.rig.leftArm.rotation.x = -swing * 0.65;
+          entry.rig.rightArm.rotation.x =
+            comp.action === 'cleave' || comp.action === 'cavalry_charge'
+              ? Math.sin(elapsedTotal * 7) * 0.55
+              : swing * 0.65;
+
+          const distToCam = Math.hypot(entry.sx - camTarget.x, entry.sz - camTarget.z);
+          if (state === 'playing' && distToCam < 22) {
+            _proj.set(entry.sx, cy + (comp.mounted ? 3.0 : 2.2), entry.sz).project(camera);
+            if (_proj.z >= -1 && _proj.z <= 1) {
+              const slot = acquirePlate(plateIdx++);
+              slot.el.style.display = 'flex';
+              const px = (_proj.x * 0.5 + 0.5) * rectW;
+              const pyScr = (-_proj.y * 0.5 + 0.5) * rectH;
+              slot.el.style.transform = `translate3d(${px}px, ${pyScr}px, 0) translate(-50%, -100%)`;
+              slot.nameEl.textContent = comp.name;
+              slot.fillEl.style.width = `${Math.max(0, Math.min(100, (comp.hp / comp.maxHp) * 100))}%`;
+              slot.fillEl.style.backgroundColor = comp.accentColor;
+            }
+          }
+        }
+        for (const [cid, entry] of companionRigs) {
+          if (!activeCompIds.has(cid)) {
+            scene.remove(entry.rig.root);
+            companionRigs.delete(cid);
+          }
+        }
+
         // Sync Enemies & Diegetic Windup Telegraphs
         const localPlayer = getLocalPlayer();
         let targetVisible = false;
         let telegraphUsed = 0;
+        const activeEnemyIds = new Set<string>();
 
         for (const e of snap.enemies) {
+          activeEnemyIds.add(e.id);
           let entry = enemyRigs.get(e.id);
           if (!entry) {
             const rig = buildEnemyRig(e.archetype, textures.contactShadow);
+            applyActorShaderEnhance(rig.root);
             const hitProxy = new THREE.Mesh(
               new THREE.SphereGeometry(e.isBoss ? 1.8 : 1.15, 8, 8),
               new THREE.MeshBasicMaterial({ visible: false }),
@@ -1121,6 +1639,9 @@ export default function IsometricWorldCanvas({
             entry.rig.bodyPivot.rotation.x = THREE.MathUtils.damp(entry.rig.bodyPivot.rotation.x, Math.PI * 0.48, 12, rawDt);
             entry.rig.bodyPivot.scale.setScalar(0.85);
             continue;
+          } else if (e.hiddenInCover) {
+            entry.rig.bodyPivot.rotation.x = 0;
+            entry.rig.bodyPivot.scale.set(0.88, 0.72, 0.88);
           } else {
             entry.rig.bodyPivot.rotation.x = 0;
             entry.rig.bodyPivot.scale.setScalar(1);
@@ -1184,10 +1705,11 @@ export default function IsometricWorldCanvas({
             (tm.material as THREE.MeshBasicMaterial).opacity = 0.28 + Math.sin(elapsedTotal * 18) * 0.14;
           }
 
-          // Project enemy HP plate when damaged, targeted, or boss nearby
+          // Project enemy HP plate when damaged, targeted, or boss nearby (concealed while hiddenInCover)
           const distToCam = Math.hypot(entry.sx - camTarget.x, entry.sz - camTarget.z);
           if (
             state === 'playing' &&
+            !e.hiddenInCover &&
             distToCam < 28 &&
             (e.hp < e.maxHp || e.isBoss || localPlayer?.targetEnemyId === e.id)
           ) {
@@ -1202,6 +1724,14 @@ export default function IsometricWorldCanvas({
               slot.fillEl.style.width = `${Math.max(0, Math.min(100, (e.hp / e.maxHp) * 100))}%`;
               slot.fillEl.style.backgroundColor = e.isBoss ? '#f59e0b' : '#f43f5e';
             }
+          }
+        }
+        for (const [eid, entry] of enemyRigs) {
+          if (!activeEnemyIds.has(eid)) {
+            scene.remove(entry.rig.root);
+            const idx = enemyClickProxies.indexOf(entry.hitProxy);
+            if (idx >= 0) enemyClickProxies.splice(idx, 1);
+            enemyRigs.delete(eid);
           }
         }
         if (!targetVisible) targetRingMesh.visible = false;
@@ -1293,7 +1823,11 @@ export default function IsometricWorldCanvas({
           } else if (ev.kind === 'damage' && ev.value !== undefined) {
             spawnFloatingText(ev.x, ev.y, ev.z, `-${ev.value}`, ev.color);
             spawnParticles(ev.x, ev.y - 0.5, ev.z, 6, ev.color, 4);
-            if (ev.value >= 45) {
+            if (ev.value >= 55 && localPlayer?.activeStance === 'heavy') {
+              hitstopTimer = 0.045;
+              trauma = Math.min(1, trauma + 0.32);
+              gameAudio.playHeavyBlow();
+            } else if (ev.value >= 45) {
               hitstopTimer = 0.035;
               trauma = Math.min(1, trauma + 0.25);
               gameAudio.playHit();
@@ -1306,6 +1840,35 @@ export default function IsometricWorldCanvas({
           } else if (ev.kind === 'shrine_capture' || ev.kind === 'level_up') {
             spawnFloatingText(ev.x, ev.y, ev.z, ev.label || 'Ascended!', ev.color);
             spawnParticles(ev.x, ev.y, ev.z, 20, ev.color, 7);
+          } else if (ev.kind === 'quest_complete') {
+            spawnFloatingText(ev.x, ev.y + 0.5, ev.z, ev.label || 'Quest Complete', ev.color);
+            spawnParticles(ev.x, ev.y, ev.z, 22, ev.color, 6.5);
+            gameAudio.playLevelUp();
+          } else if (ev.kind === 'world_event') {
+            spawnFloatingText(ev.x, ev.y + 1.4, ev.z, ev.label || 'World Event', ev.color);
+            spawnGroundPulse(ev.x, ev.y, ev.z, 6, ev.color);
+            spawnParticles(ev.x, ev.y + 0.8, ev.z, 26, ev.color, 8);
+          } else if (ev.kind === 'lightning') {
+            spawnGroundPulse(ev.x, ev.y, ev.z, ev.radius || 3.4, ev.color);
+            spawnParticles(ev.x, ev.y + 0.8, ev.z, 18, ev.color, 7);
+            trauma = Math.min(1, trauma + 0.28);
+          } else if (ev.kind === 'roar') {
+            spawnFloatingText(ev.x, ev.y + 1.2, ev.z, ev.label || 'BATTLE ROAR!', ev.color);
+            spawnGroundPulse(ev.x, ev.y, ev.z, ev.radius || 7, ev.color);
+            spawnParticles(ev.x, ev.y + 0.6, ev.z, 20, ev.color, 6.5);
+            trauma = Math.min(1, trauma + 0.35);
+            gameAudio.playRoar();
+          } else if (ev.kind === 'whistle') {
+            spawnFloatingText(ev.x, ev.y + 1.3, ev.z, ev.label || 'AMBUSH WHISTLE!', ev.color);
+            spawnGroundPulse(ev.x, ev.y, ev.z, ev.radius || 5, ev.color);
+            gameAudio.playWhistle();
+          } else if (ev.kind === 'crow_alert') {
+            spawnFloatingText(ev.x, ev.y + 1.4, ev.z, ev.label || 'Crows Scatter!', ev.color);
+            gameAudio.playCrowCaw();
+          } else if (ev.kind === 'whetstone') {
+            spawnFloatingText(ev.x, ev.y + 0.8, ev.z, ev.label || 'Blade Honed', ev.color);
+            spawnParticles(ev.x, ev.y + 0.6, ev.z, 12, ev.color, 4.5);
+            gameAudio.playWhetstone();
           }
         }
 
@@ -1320,6 +1883,8 @@ export default function IsometricWorldCanvas({
             document.body.dataset.playerLevel = String(lp.level);
           }
           document.body.dataset.onlineCount = String(snap.onlineCount);
+          document.body.dataset.worldEvent =
+            snap.dynamicEvent?.status === 'active' ? snap.dynamicEvent.kind : 'idle';
           const targetEnemy = lp?.targetEnemyId
             ? snap.enemies.find((en) => en.id === lp.targetEnemyId && en.phase !== 'ko') ?? null
             : null;
@@ -1329,9 +1894,20 @@ export default function IsometricWorldCanvas({
             shrines: snap.shrines,
             allPlayers: snap.players,
             allEnemies: snap.enemies,
+            companions: snap.companions ?? [],
+            tacticalAdvice: snap.tacticalAdvice ?? null,
             onlineCount: snap.onlineCount,
             dbMode: snap.dbMode,
             zoneName: lp ? getZoneLabel(lp.x, lp.z) : 'Solis Sanctuary',
+            dynamicEvent: snap.dynamicEvent ?? null,
+            nextEventInSec: snap.nextEventInSec ?? 0,
+            serverTime: snap.serverTime,
+          });
+          callbacksRef.current.onGraphicsStatus?.({
+            profile: currentProfile,
+            isSoftwareGl,
+            todLabel: atmo.todLabel,
+            resolvedWeather: activeWeather,
           });
         }
       }
@@ -1440,13 +2016,70 @@ export default function IsometricWorldCanvas({
           camTarget.z + Math.cos(cameraYaw) * horizDist,
         );
         camera.lookAt(camTarget);
-
-        // Keep sun shadow frustum centered near player
-        sunLight.position.set(camTarget.x + 28, 46, camTarget.z + 20);
-        sunLight.target.position.copy(camTarget);
       }
 
-      renderer.render(scene, camera);
+      // Position key & opposite rim lights relative to camera focus
+      sunLight.position.set(
+        camTarget.x + atmo.sunDirection[0] * 48,
+        Math.max(12, atmo.sunDirection[1] * 56),
+        camTarget.z + atmo.sunDirection[2] * 48,
+      );
+      sunLight.target.position.copy(camTarget);
+      rimLight.position.set(
+        camTarget.x - atmo.sunDirection[0] * 34,
+        18,
+        camTarget.z - atmo.sunDirection[2] * 34,
+      );
+
+      // Update Weather Precipitation Instances (Zero-GC)
+      if (activeWeather === 'clear') {
+        precipMesh.visible = false;
+      } else {
+        precipMesh.visible = true;
+        const activeCount = Math.min(MAX_PRECIP, currentProfile.precipitationCount);
+        precipMesh.count = activeCount;
+        if (activeWeather === 'rain') {
+          precipMat.color.setHex(0xbfe4ff);
+          precipMat.opacity = 0.55;
+        } else if (activeWeather === 'snow') {
+          precipMat.color.setHex(0xf1f7ff);
+          precipMat.opacity = 0.78;
+        } else {
+          precipMat.color.setHex(0xe879f9);
+          precipMat.opacity = 0.72;
+        }
+        for (let i = 0; i < activeCount; i++) {
+          const d = precipDrops[i];
+          if (activeWeather === 'rain') {
+            const y = 20 - ((elapsedTotal * 26 + d.oy) % 21);
+            _v3.set(camTarget.x + d.ox - (20 - y) * 0.12, y, camTarget.z + d.oz);
+            _quat.setFromEuler(new THREE.Euler(0.08, 0, -0.14));
+            _scale.set(0.65, 1.35, 0.65);
+          } else if (activeWeather === 'snow') {
+            const y = 18 - ((elapsedTotal * 3.6 + d.oy) % 19);
+            const swayX = Math.sin(elapsedTotal * 1.4 + d.phase) * 1.3;
+            const swayZ = Math.cos(elapsedTotal * 1.1 + d.phase) * 1.3;
+            _v3.set(camTarget.x + d.ox + swayX, y, camTarget.z + d.oz + swayZ);
+            _quat.identity();
+            _scale.set(2.2, 0.14, 2.2);
+          } else {
+            const y = 0.4 + ((elapsedTotal * 2.5 + d.oy) % 16);
+            const swirlX = Math.sin(elapsedTotal * 1.9 + d.phase) * 0.9;
+            _v3.set(camTarget.x + d.ox + swirlX, y, camTarget.z + d.oz);
+            _quat.identity();
+            _scale.set(1.8, 0.24, 1.8);
+          }
+          _mat4.compose(_v3, _quat, _scale);
+          precipMesh.setMatrixAt(i, _mat4);
+        }
+        precipMesh.instanceMatrix.needsUpdate = true;
+      }
+
+      if (currentProfile.postProcessEnabled) {
+        postStack.composer.render();
+      } else {
+        renderer.render(scene, camera);
+      }
 
       if (isSoftwareGl) {
         afterDraw(tick);
@@ -1472,11 +2105,27 @@ export default function IsometricWorldCanvas({
       renderer.domElement.removeEventListener('wheel', onWheel);
       renderer.domElement.removeEventListener('pointerdown', onPointerDown);
       renderer.domElement.removeEventListener('pointerup', onPointerUp);
+      applyGraphicsRef.current = null;
+      postStack.dispose();
       textures.dispose();
       terrainGeo.dispose();
       terrainMat.dispose();
       riverGeo.dispose();
       riverMat.dispose();
+      mistGeo.dispose();
+      mistMat.dispose();
+      shaftGeo.dispose();
+      shaftMat.dispose();
+      precipGeo.dispose();
+      precipMat.dispose();
+      barrowTurfMat.dispose();
+      blackOakMat.dispose();
+      thornFoliageMat.dispose();
+      crowGeo.dispose();
+      crowMat.dispose();
+      boulderMat.dispose();
+      cliffGeo.dispose();
+      cliffMat.dispose();
       trunkGeo.dispose();
       trunkMat.dispose();
       canopyGeo.dispose();
@@ -1486,6 +2135,8 @@ export default function IsometricWorldCanvas({
       particleMat.dispose();
       sharedProjGeo.dispose();
       sharedLootGeo.dispose();
+      questCompassGeo.dispose();
+      questCompassMat.dispose();
       renderer.dispose();
       if (renderer.domElement.parentNode === container) {
         container.removeChild(renderer.domElement);

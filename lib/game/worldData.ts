@@ -212,6 +212,10 @@ export const WORLD_OBSTACLES: WorldObstacle[] = [
   { id: 'boulder-6', x: 20, z: -38, radius: 2.2, height: 3.1, kind: 'boulder' },
   { id: 'pillar-bridge-w', x: -5.5, z: -4.5, radius: 0.95, height: 3.8, kind: 'pillar' },
   { id: 'pillar-bridge-e', x: 5.5, z: -4.5, radius: 0.95, height: 3.8, kind: 'pillar' },
+  // Barrowlands Ridge: The Ancient Barrow Mound & Liar's Copse
+  { id: 'barrow-mound', x: -28, z: 22, radius: 3.4, height: 3.6, kind: 'barrow' },
+  { id: 'copse-west', x: -19, z: 18.5, radius: 1.4, height: 3.2, kind: 'copse' },
+  { id: 'copse-east', x: -21.5, z: 26, radius: 1.4, height: 3.2, kind: 'copse' },
 ];
 
 export interface EnemySpawnTemplate {
@@ -230,6 +234,10 @@ export const ENEMY_SPAWNS: EnemySpawnTemplate[] = [
   { id: 'mob-stalker-2', archetype: 'stalker', name: 'Rift Stalker', level: 1, x: -23, z: -4, isBoss: false },
   { id: 'mob-acolyte-1', archetype: 'acolyte', name: 'Void Acolyte', level: 2, x: -30, z: -18, isBoss: false },
   { id: 'mob-colossus-1', archetype: 'colossus', name: 'Iron Colossus', level: 3, x: -34, z: -26, isBoss: false },
+
+  // Barrowlands Ridge & Liar's Copse Patrols
+  { id: 'mob-thief-1', archetype: 'thief', name: 'Copse Cutthroat', level: 2, x: -16.5, z: 21, isBoss: false },
+  { id: 'mob-thief-2', archetype: 'thief', name: 'Barrow Marauder', level: 2, x: -24, z: 27, isBoss: false },
 
   // East Verdant Crossing
   { id: 'mob-stalker-3', archetype: 'stalker', name: 'Rift Stalker', level: 1, x: 18, z: 3, isBoss: false },
@@ -279,6 +287,7 @@ export function groundHeightAt(x: number, z: number): number {
 
 export function getZoneName(x: number, z: number): string {
   if (Math.hypot(x, z - 14) < 13) return 'Solis Sanctuary';
+  if (x < -14 && z > 10) return 'Barrowlands Ridge';
   if (z < -30) return 'Obsidian Citadel';
   if (x < -14) return 'Dawn Spire Glade';
   if (x > 14) return 'Verdant Crossing';

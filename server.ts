@@ -9,14 +9,31 @@ import type {
   WorldSnapshot,
 } from './lib/game/types.ts';
 import {
+  claimPlayerQuest,
   createSimWorld,
+  emitPlayerBoonEffect,
   equipInventoryItem,
+  executeCampPrep,
+  executeMountedManeuver,
+  executePathAbility,
   executePlayerSkill,
+  resolvePhilosophicalChoice,
+  setPlayerCombatStance,
+  startDynamicWorldEvent,
   stepSimWorld,
+  togglePlayerMount,
   triggerPlayerDash,
   usePlayerPotion,
 } from './lib/game/simulation.ts';
-import { getSpawnPoint, groundHeightAt } from './lib/game/worldData.ts';
+import { sanitizeAppearance } from './lib/game/appearance.ts';
+import {
+  activateBattlePass,
+  applyRewardedAdBenefit,
+  claimBattlePassTierReward,
+  enforceUnlockedAppearance,
+  purchaseCosmeticItem,
+} from './lib/game/monetization.ts';
+import { getSpawnPoint, groundHeightAt, INITIAL_SHRINES } from './lib/game/worldData.ts';
 import {
   appendChatMessage,
   getDbMode,
@@ -24,6 +41,10 @@ import {
   loadOrCreatePlayer,
   loadRecentChat,
   loadWorldShrines,
+  recordLegacyLedger,
+  recordMonetizationLedger,
+  saveActiveWorldEvent,
+  savePlayerQuests,
   savePlayerState,
   saveWorldShrine,
 } from './lib/db/turso.ts';
@@ -44,13 +65,31 @@ interface ClientConn {
 }
 
 async function startServer() {
-  await app.prepare();
-  await initDatabase();
-
-  const initialShrines = await loadWorldShrines();
-  const world = createSimWorld(initialShrines);
+  const world = createSimWorld(INITIAL_SHRINES);
   const clients = new Set<ClientConn>();
   const socketByPlayer = new Map<string, WebSocket>();
+
+  let nextReady = false;
+  const preparePromise = app
+    .prepare()
+    .then(() => {
+      nextReady = true;
+    })
+    .catch((err) => {
+      console.error('Next.js prepare failed:', err);
+      process.exit(1);
+    });
+
+  const dbInitPromise = initDatabase()
+    .then(() => loadWorldShrines())
+    .then((persistedShrines) => {
+      if (persistedShrines.length > 0) {
+        world.shrines = persistedShrines;
+      }
+    })
+    .catch((err) => {
+      console.error('Database startup initialization warning:', err);
+    });
 
   const sendToSocket = (ws: WebSocket, msg: ServerMessage) => {
     if (ws.readyState === WebSocket.OPEN) {
@@ -74,12 +113,45 @@ async function startServer() {
     const ws = socketByPlayer.get(player.id);
     if (ws) {
       sendToSocket(ws, { type: 'inventory', items: player.inventory });
+      sendToSocket(ws, {
+        type: 'monetization',
+        monetization: player.monetization,
+        appearance: player.appearance,
+      });
+      sendToSocket(ws, {
+        type: 'philosophy',
+        philosophy: player.philosophy,
+      });
+    }
+  };
+
+  world.onPersistQuests = (player) => {
+    savePlayerQuests(player).catch((err) => {
+      console.error('Failed to persist quests to libSQL:', err);
+    });
+    const ws = socketByPlayer.get(player.id);
+    if (ws) {
+      sendToSocket(ws, {
+        type: 'quests',
+        quests: player.quests,
+        trackedQuestId: player.trackedQuestId,
+      });
     }
   };
 
   world.onPersistShrine = (shrine) => {
     saveWorldShrine(shrine).catch((err) => {
       console.error('Failed to persist shrine state to libSQL:', err);
+    });
+  };
+
+  let lastEventPersistMs = 0;
+  world.onPersistWorldEvent = (evt) => {
+    const now = Date.now();
+    if (evt.status === 'active' && now - lastEventPersistMs < 1500) return;
+    lastEventPersistMs = now;
+    saveActiveWorldEvent(evt).catch((err) => {
+      console.error('Failed to persist dynamic world event to libSQL:', err);
     });
   };
 
@@ -95,9 +167,20 @@ async function startServer() {
     broadcastMessage({ type: 'chat', message: msg });
   };
 
-  const server = http.createServer((req, res) => {
-    const parsedUrl = parse(req.url || '/', true);
-    handle(req, res, parsedUrl);
+  const server = http.createServer(async (req, res) => {
+    try {
+      if (!nextReady) {
+        await preparePromise;
+      }
+      const parsedUrl = parse(req.url || '/', true);
+      await handle(req, res, parsedUrl);
+    } catch (err) {
+      console.error('HTTP request error:', err);
+      if (!res.headersSent) {
+        res.statusCode = 500;
+        res.end('Internal Server Error');
+      }
+    }
   });
 
   const wss = new WebSocketServer({ noServer: true });
@@ -134,6 +217,7 @@ async function startServer() {
 
       try {
         if (msg.type === 'join') {
+          await dbInitPromise;
           const cleanId = String(msg.playerId || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48);
           if (!cleanId) return;
 
@@ -141,7 +225,13 @@ async function startServer() {
           socketByPlayer.set(cleanId, ws);
 
           const spawnIdx = world.players.size;
-          const player = await loadOrCreatePlayer(cleanId, msg.name, msg.heroClass, spawnIdx);
+          const player = await loadOrCreatePlayer(
+            cleanId,
+            msg.name,
+            msg.heroClass,
+            spawnIdx,
+            msg.appearance,
+          );
           world.players.set(cleanId, player);
 
           const chatHistory = await loadRecentChat(14);
@@ -151,6 +241,11 @@ async function startServer() {
             dbMode: getDbMode(),
             chatHistory,
             inventory: player.inventory,
+            quests: player.quests,
+            trackedQuestId: player.trackedQuestId,
+            appearance: player.appearance,
+            monetization: player.monetization,
+            philosophy: player.philosophy,
           });
 
           const joinMsg: ChatMessage = {
@@ -173,6 +268,19 @@ async function startServer() {
           player.input.moveZ = Math.max(-1, Math.min(1, Number(msg.moveZ) || 0));
           player.input.waypointX = msg.waypointX !== null ? Number(msg.waypointX) : null;
           player.input.waypointZ = msg.waypointZ !== null ? Number(msg.waypointZ) : null;
+        } else if (msg.type === 'update_appearance') {
+          const sanitized = sanitizeAppearance(msg.appearance, player.heroClass);
+          player.appearance = enforceUnlockedAppearance(
+            sanitized,
+            player.appearance,
+            player.monetization.unlockedCosmetics,
+          );
+          savePlayerState(player).catch(() => {});
+          sendToSocket(ws, {
+            type: 'monetization',
+            monetization: player.monetization,
+            appearance: player.appearance,
+          });
         } else if (msg.type === 'cast') {
           if (msg.targetEnemyId !== undefined) {
             player.targetEnemyId = msg.targetEnemyId;
@@ -187,6 +295,175 @@ async function startServer() {
         } else if (msg.type === 'equip_item') {
           if (equipInventoryItem(player, msg.itemId)) {
             savePlayerState(player).catch(() => {});
+          }
+        } else if (msg.type === 'claim_quest') {
+          claimPlayerQuest(world, player, String(msg.questId || ''));
+        } else if (msg.type === 'track_quest') {
+          player.trackedQuestId = msg.questId ? String(msg.questId) : null;
+          savePlayerState(player).catch(() => {});
+          sendToSocket(ws, {
+            type: 'quests',
+            quests: player.quests,
+            trackedQuestId: player.trackedQuestId,
+          });
+        } else if (msg.type === 'trigger_world_event') {
+          if (!world.dynamicEvent) {
+            startDynamicWorldEvent(world, Date.now(), msg.kind);
+          }
+        } else if (msg.type === 'set_stance') {
+          setPlayerCombatStance(world, player, msg.stance);
+          sendToSocket(ws, {
+            type: 'philosophy',
+            philosophy: player.philosophy,
+            notice: `Stance shifted to ${msg.stance}`,
+          });
+        } else if (msg.type === 'toggle_mount') {
+          togglePlayerMount(world, player);
+          sendToSocket(ws, {
+            type: 'philosophy',
+            philosophy: player.philosophy,
+          });
+        } else if (msg.type === 'mounted_maneuver') {
+          const res = executeMountedManeuver(world, player, msg.maneuver, msg.dirX, msg.dirZ);
+          if (!res.ok) {
+            sendToSocket(ws, {
+              type: 'philosophy',
+              philosophy: player.philosophy,
+              notice: res.reason,
+            });
+          }
+        } else if (msg.type === 'prepare_camp') {
+          const res = executeCampPrep(world, player, msg.action);
+          sendToSocket(ws, {
+            type: 'philosophy',
+            philosophy: player.philosophy,
+            notice: res.notice,
+          });
+        } else if (msg.type === 'philosophical_choice') {
+          const res = resolvePhilosophicalChoice(world, player, msg.dilemmaId, msg.optionId);
+          if (res.ok) {
+            recordLegacyLedger(
+              player.id,
+              'dilemma',
+              res.path || 'balanced',
+              `${msg.dilemmaId}: ${res.label || msg.optionId}`,
+            ).catch(() => {});
+          }
+          sendToSocket(ws, {
+            type: 'philosophy',
+            philosophy: player.philosophy,
+            notice: res.notice,
+          });
+        } else if (msg.type === 'use_path_ability') {
+          const res = executePathAbility(world, player, msg.abilityId);
+          sendToSocket(ws, {
+            type: 'philosophy',
+            philosophy: player.philosophy,
+            notice: res.notice,
+          });
+        } else if (msg.type === 'purchase_cosmetic') {
+          const method = msg.method === 'gold' ? 'gold' : 'direct';
+          const res = purchaseCosmeticItem(
+            player,
+            String(msg.itemId || ''),
+            method,
+            msg.autoEquip !== false,
+          );
+          if (res.ok && res.item) {
+            if (!res.alreadyOwned) {
+              emitPlayerBoonEffect(world, player, `Unlocked: ${res.item.name}`, '#e5a93c');
+              recordMonetizationLedger(
+                player.id,
+                method === 'gold' ? 'cosmetic_gold' : 'cosmetic_iap',
+                res.item.id,
+                res.item.name,
+              ).catch(() => {});
+            }
+            savePlayerState(player).catch(() => {});
+            sendToSocket(ws, {
+              type: 'monetization',
+              monetization: player.monetization,
+              appearance: player.appearance,
+              notice: res.alreadyOwned ? `Equipped ${res.item.name}` : `Unlocked & equipped ${res.item.name}`,
+            });
+          } else {
+            sendToSocket(ws, {
+              type: 'monetization',
+              monetization: player.monetization,
+              notice: res.reason || 'Purchase failed',
+            });
+          }
+        } else if (msg.type === 'activate_battle_pass') {
+          const method = msg.method === 'gold' ? 'gold' : 'subscription';
+          const res = activateBattlePass(player, method);
+          if (res.ok) {
+            emitPlayerBoonEffect(world, player, 'Covenant Battle Pass Active!', '#e5a93c');
+            recordMonetizationLedger(
+              player.id,
+              method === 'gold' ? 'battle_pass_gold' : 'battle_pass_sub',
+              'season_1_covenant',
+              'Covenant Battle Pass Subscription',
+            ).catch(() => {});
+            savePlayerState(player).catch(() => {});
+            sendToSocket(ws, {
+              type: 'monetization',
+              monetization: player.monetization,
+              notice: 'Covenant Battle Pass activated for Season I',
+            });
+          } else {
+            sendToSocket(ws, {
+              type: 'monetization',
+              monetization: player.monetization,
+              notice: res.reason || 'Unable to activate pass',
+            });
+          }
+        } else if (msg.type === 'claim_pass_tier') {
+          const track = msg.track === 'premium' ? 'premium' : 'free';
+          const res = claimBattlePassTierReward(player, Number(msg.tier), track);
+          if (res.ok) {
+            emitPlayerBoonEffect(world, player, `Pass Tier ${msg.tier}: ${res.rewardLabel}`, '#34d399');
+            recordMonetizationLedger(
+              player.id,
+              'pass_tier_claim',
+              `tier_${msg.tier}_${track}`,
+              res.rewardLabel || 'Tier Reward',
+            ).catch(() => {});
+            savePlayerState(player).catch(() => {});
+            sendToSocket(ws, {
+              type: 'monetization',
+              monetization: player.monetization,
+              appearance: player.appearance,
+              notice: `Claimed Tier ${msg.tier}: ${res.rewardLabel}`,
+            });
+          } else {
+            sendToSocket(ws, {
+              type: 'monetization',
+              monetization: player.monetization,
+              notice: res.reason || 'Unable to claim tier reward',
+            });
+          }
+        } else if (msg.type === 'claim_ad_reward') {
+          const res = applyRewardedAdBenefit(player, msg.kind, Date.now());
+          if (res.ok && res.offer) {
+            emitPlayerBoonEffect(world, player, `${res.offer.title}!`, res.offer.accentColor);
+            recordMonetizationLedger(
+              player.id,
+              'rewarded_ad',
+              res.offer.kind,
+              res.offer.benefitLabel,
+            ).catch(() => {});
+            savePlayerState(player).catch(() => {});
+            sendToSocket(ws, {
+              type: 'monetization',
+              monetization: player.monetization,
+              notice: `Ad Blessing Active: ${res.offer.title}`,
+            });
+          } else {
+            sendToSocket(ws, {
+              type: 'monetization',
+              monetization: player.monetization,
+              notice: res.reason || 'Rewarded blessing unavailable',
+            });
           }
         } else if (msg.type === 'respawn') {
           if (!player.alive) {
@@ -225,6 +502,7 @@ async function startServer() {
         const player = world.players.get(pid);
         if (player) {
           savePlayerState(player).catch(() => {});
+          savePlayerQuests(player).catch(() => {});
           world.players.delete(pid);
         }
         if (socketByPlayer.get(pid) === ws) {
@@ -244,7 +522,7 @@ async function startServer() {
     lastTick = now;
 
     if (world.players.size > 0) {
-      stepSimWorld(world, dt);
+      stepSimWorld(world, dt, now);
     }
 
     persistAccum += dt;
@@ -252,6 +530,9 @@ async function startServer() {
       persistAccum = 0;
       for (const p of world.players.values()) {
         savePlayerState(p).catch(() => {});
+      }
+      if (world.dynamicEvent) {
+        saveActiveWorldEvent(world.dynamicEvent).catch(() => {});
       }
     }
 
@@ -265,6 +546,7 @@ async function startServer() {
         id: p.id,
         name: p.name,
         heroClass: p.heroClass,
+        appearance: p.appearance,
         level: p.level,
         xp: Math.round(p.xp),
         xpToNext: p.xpToNext,
@@ -294,6 +576,18 @@ async function startServer() {
         waypointZ: p.input.waypointZ,
         weaponPower: p.weaponPower,
         charmPower: p.charmPower,
+        trackedQuestId: p.trackedQuestId,
+        activeBuffs: p.monetization.activeAdBuffs,
+        activeStance: p.philosophy.activeStance,
+        mounted: p.philosophy.mounted,
+        stamina: Math.round(p.philosophy.stamina),
+        maxStamina: p.philosophy.maxStamina,
+        weaponOil: p.philosophy.weaponOil,
+        oilCharges: p.philosophy.oilCharges,
+        arblastBolt: p.philosophy.arblastBolt,
+        boltAmmo: p.philosophy.boltAmmo,
+        whetstoneActive: p.philosophy.whetstoneExpiresAt > now,
+        potentialScore: p.philosophy.potentialScore,
       })),
       enemies: world.enemies.map((e) => ({
         id: e.id,
@@ -301,6 +595,7 @@ async function startServer() {
         name: e.name,
         level: e.level,
         isBoss: e.isBoss,
+        eventId: e.eventId,
         x: Number(e.x.toFixed(3)),
         z: Number(e.z.toFixed(3)),
         facing: Number(e.facing.toFixed(3)),
@@ -313,11 +608,30 @@ async function startServer() {
         telegraphRadius: e.telegraphRadius,
         telegraphKind: e.telegraphKind,
         hurtFlash: Number(e.hurtFlash.toFixed(2)),
+        hiddenInCover: e.hiddenInCover,
+        aiRole: e.aiRole,
+      })),
+      companions: world.companions.map((c) => ({
+        id: c.id,
+        name: c.name,
+        title: c.title,
+        role: c.role,
+        x: Number(c.x.toFixed(3)),
+        z: Number(c.z.toFixed(3)),
+        facing: Number(c.facing.toFixed(3)),
+        hp: Math.round(c.hp),
+        maxHp: c.maxHp,
+        mounted: c.mounted,
+        action: c.action,
+        accentColor: c.accentColor,
       })),
       shrines: world.shrines,
       loot: world.loot,
       projectiles: world.projectiles,
       events: world.events,
+      dynamicEvent: world.dynamicEvent,
+      nextEventInSec: Math.max(0, Math.ceil(world.nextEventCountdownSec)),
+      tacticalAdvice: world.tacticalAdvice,
     };
 
     broadcastMessage({ type: 'snapshot', data: snapshot });
@@ -332,6 +646,10 @@ async function startServer() {
     clearInterval(tickInterval);
     for (const p of world.players.values()) {
       savePlayerState(p).catch(() => {});
+      savePlayerQuests(p).catch(() => {});
+    }
+    if (world.dynamicEvent) {
+      saveActiveWorldEvent(world.dynamicEvent).catch(() => {});
     }
     wss.close();
     server.close(() => process.exit(0));
